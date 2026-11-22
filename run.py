@@ -6,14 +6,18 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 MARKERS = {
     "constructor-started", "constructor-returned", "panel-visible-on-screen",
     "native-key-input-posted", "native-key-input-unavailable", "native-escape-posted",
     "programmatic-dismissal-requested", "panel-dismissed-without-confirming",
     "panel-confirmed", "open-sample-verified", "save-sample-verified",
-    "confirmed-operation-unverified", "open-input-unavailable",
-    "native-open-file-click-posted", "open-file-row-unavailable",
+    "confirmed-operation-unverified", "open-panel-key", "keyboard-driver-started",
+    "keyboard-input-unavailable", "keyboard-target-not-frontmost", "keyboard-target-frontmost",
+    "open-panel-key-lost", "open-panel-key-restored", "go-to-shortcut-posted", "absolute-path-posted",
+    "go-to-return-posted", "open-return-posted", "open-selected-url-verified",
+    "open-selected-url-mismatch", "open-sample-read-mismatch",
 }
 
 
@@ -40,41 +44,46 @@ def run_panel(executable, phase, kind, root):
 def confirm_open(executable, root):
     folder = root / "open-confirmation"
     folder.mkdir()
+    filename = f"open-{uuid.uuid4().hex}.txt"
     transcript = root / "open-transcript"
     driver_output = b""
+    driver_result = "not-started"
     with transcript.open("wb") as output, subprocess.Popen(
-        [executable, "confirm-open", folder], stdout=output, stderr=subprocess.DEVNULL
+        [executable, "confirm-open", folder, filename], stdout=output, stderr=subprocess.DEVNULL
     ) as panel:
-        deadline = time.monotonic() + 17
+        deadline = time.monotonic() + 16
         while panel.poll() is None and time.monotonic() < deadline:
-            if b"panel-visible-on-screen" in transcript.read_bytes():
+            if b"open-panel-key" in transcript.read_bytes():
                 try:
-                    driver = subprocess.run([executable, "select-open", str(panel.pid)],
-                                            timeout=12, capture_output=True)
+                    driver = subprocess.run([executable, "keyboard-open", str(panel.pid),
+                                             folder / filename], timeout=15, capture_output=True)
                     driver_output = driver.stdout
+                    driver_result = f"exit-{driver.returncode}"
                 except subprocess.TimeoutExpired as error:
                     driver_output = error.stdout or b""
+                    driver_result = "timeout"
                 break
             time.sleep(0.15)
         try:
-            result = f"exit-{panel.wait(timeout=max(1, deadline - time.monotonic()))}"
+            result = f"exit-{panel.wait(timeout=6)}"
         except subprocess.TimeoutExpired:
             panel.kill()
             panel.wait()
-            result = "timeout"
-    panel_output = transcript.read_bytes()
+            result = "no-modal-response-before-timeout"
 
     def markers(output):
         return [line for line in output.decode(errors="replace").splitlines() if line in MARKERS]
 
     driver_marks = markers(driver_output)
-    panel_marks = markers(panel_output)
-    print(f"open input: {' '.join(driver_marks) or 'no-markers'}", flush=True)
+    panel_marks = markers(transcript.read_bytes())
+    print(f"open input: {driver_result}; {' '.join(driver_marks) or 'no-markers'}", flush=True)
     print(f"open result: {result}; {' '.join(panel_marks) or 'no-markers'}", flush=True)
     return (
         result == "exit-0"
-        and "native-open-file-click-posted" in driver_marks
-        and {"panel-visible-on-screen", "panel-confirmed", "open-sample-verified"}.issubset(panel_marks)
+        and driver_result == "exit-0"
+        and "open-return-posted" in driver_marks
+        and {"panel-visible-on-screen", "panel-confirmed", "open-selected-url-verified",
+             "open-sample-verified"}.issubset(panel_marks)
     )
 
 

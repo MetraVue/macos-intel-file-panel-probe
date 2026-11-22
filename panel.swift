@@ -1,5 +1,4 @@
 import AppKit
-import ApplicationServices
 import CoreGraphics
 import Darwin
 
@@ -16,73 +15,62 @@ func key(_ code: CGKeyCode, flags: CGEventFlags = []) {
     }
 }
 
-func selectOpenFile(pid: pid_t) -> Bool {
-    guard AXIsProcessTrusted(), CGPreflightPostEventAccess() else {
-        report("open-input-unavailable")
+func keyboardOpen(pid: pid_t, path: String) -> Bool {
+    report("keyboard-driver-started")
+    guard CGPreflightPostEventAccess() else {
+        report("keyboard-input-unavailable")
         return false
     }
-    let app = AXUIElementCreateApplication(pid)
-    AXUIElementSetMessagingTimeout(app, 0.3)
-    let desktop = AXUIElementCreateSystemWide()
 
-    func attribute(_ node: AXUIElement, _ name: String) -> CFTypeRef? {
-        var result: CFTypeRef?
-        return AXUIElementCopyAttributeValue(node, name as CFString, &result) == .success ? result : nil
-    }
-
-    let until = Date().addingTimeInterval(10)
-    while Date() < until {
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
-            var nodes = attribute(app, "AXWindows") as? [AXUIElement] ?? []
-            var visited = 0
-            while let node = nodes.popLast(), visited < 1000 {
-                visited += 1
-                nodes.append(contentsOf: attribute(node, "AXChildren") as? [AXUIElement] ?? [])
-                let name = ["AXTitle", "AXValue", "AXDescription"].compactMap { attribute(node, $0) as? String }
-                guard name.contains("sample.txt") || name.contains("sample"),
-                      let position = attribute(node, "AXPosition"), let size = attribute(node, "AXSize"),
-                      CFGetTypeID(position) == AXValueGetTypeID(), CFGetTypeID(size) == AXValueGetTypeID()
-                else { continue }
-                var origin = CGPoint.zero
-                var extent = CGSize.zero
-                guard AXValueGetValue(position as! AXValue, .cgPoint, &origin),
-                      AXValueGetValue(size as! AXValue, .cgSize, &extent),
-                      extent.width > 0, extent.height > 0 else { continue }
-                let point = CGPoint(x: origin.x + extent.width / 2, y: origin.y + extent.height / 2)
-                var hit: AXUIElement?
-                var owner: pid_t = 0
-                guard AXUIElementCopyElementAtPosition(desktop, Float(point.x), Float(point.y), &hit) == .success,
-                      let hit, AXUIElementGetPid(hit, &owner) == .success, owner == pid else { continue }
-                for count in [1, 2] {
-                    for kind in [CGEventType.leftMouseDown, .leftMouseUp] {
-                        let event = CGEvent(mouseEventSource: nil, mouseType: kind, mouseCursorPosition: point, mouseButton: .left)
-                        event?.setIntegerValueField(.mouseEventClickState, value: Int64(count))
-                        event?.post(tap: .cghidEventTap)
-                    }
-                    Thread.sleep(forTimeInterval: 0.09)
-                }
-                report("native-open-file-click-posted")
-                return true
-            }
+    func send(_ code: CGKeyCode, flags: CGEventFlags = [], character: UniChar? = nil) {
+        for pressed in [true, false] {
+            guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: pressed) else { continue }
+            event.flags = flags
+            if var character { event.keyboardSetUnicodeString(stringLength: 1, unicodeString: &character) }
+            event.post(tap: .cghidEventTap)
         }
-        Thread.sleep(forTimeInterval: 0.2)
     }
-    report("open-file-row-unavailable")
-    return false
+
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else {
+        report("keyboard-target-not-frontmost")
+        return false
+    }
+    report("keyboard-target-frontmost")
+    send(5, flags: [.maskCommand, .maskShift])
+    report("go-to-shortcut-posted")
+    Thread.sleep(forTimeInterval: 1.5)
+    send(0, flags: .maskCommand)
+    for character in path.utf16 {
+        send(0, character: character)
+        Thread.sleep(forTimeInterval: 0.015)
+    }
+    report("absolute-path-posted")
+    Thread.sleep(forTimeInterval: 1.8)
+    send(36)
+    report("go-to-return-posted")
+    Thread.sleep(forTimeInterval: 2.0)
+    send(36)
+    report("open-return-posted")
+    return true
 }
 
 let mode = CommandLine.arguments[1]
-if mode == "select-open" {
+if mode == "keyboard-open" {
     guard let pid = pid_t(CommandLine.arguments[2]) else { exit(4) }
-    exit(selectOpenFile(pid: pid) ? 0 : 4)
+    exit(keyboardOpen(pid: pid, path: CommandLine.arguments[3]) ? 0 : 4)
 }
 let confirmOpen = mode == "confirm-open"
 let isOpen = mode == "open" || confirmOpen
 let directory = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
-let sample = directory.appendingPathComponent("sample.txt")
+let filename = confirmOpen ? CommandLine.arguments[3] : "sample.txt"
+let sample = directory.appendingPathComponent(filename)
 let destination = directory.appendingPathComponent("output.txt")
 let bytes = Data((confirmOpen ? UUID().uuidString : "sample\n").utf8)
 if isOpen { try bytes.write(to: sample) }
+let initialDirectory = confirmOpen ? directory.appendingPathComponent("empty", isDirectory: true) : directory
+if confirmOpen {
+    try FileManager.default.createDirectory(at: initialDirectory, withIntermediateDirectories: false)
+}
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
@@ -99,11 +87,13 @@ DispatchQueue.main.async {
         panel.nameFieldStringValue = "output.txt"
     }
     report("constructor-returned")
-    panel.directoryURL = directory
+    panel.directoryURL = initialDirectory
     app.activate(ignoringOtherApps: true)
 
     let start = Date()
     var didSeeWindow = false
+    var didSeeKeyWindow = false
+    var keyWindowPresent = false
     var didSendInput = false
     var didConfirm = false
     var didEscape = false
@@ -119,6 +109,15 @@ DispatchQueue.main.async {
                 didSeeWindow = true
                 report("panel-visible-on-screen")
             }
+        }
+        if confirmOpen && didSeeWindow && panel.isKeyWindow && !didSeeKeyWindow {
+            didSeeKeyWindow = true
+            keyWindowPresent = true
+            report("open-panel-key")
+        }
+        if confirmOpen && didSeeKeyWindow && keyWindowPresent != panel.isKeyWindow {
+            keyWindowPresent = panel.isKeyWindow
+            report(keyWindowPresent ? "open-panel-key-restored" : "open-panel-key-lost")
         }
         if !confirmOpen && didSeeWindow && panel.isKeyWindow && !didSendInput && elapsed >= 1 {
             didSendInput = true
@@ -138,7 +137,7 @@ DispatchQueue.main.async {
             report("native-escape-posted")
             key(53)
         }
-        if elapsed >= (confirmOpen ? 13 : 9) {
+        if !confirmOpen && elapsed >= 9 {
             report("programmatic-dismissal-requested")
             panel.cancel(nil)
         }
@@ -151,9 +150,16 @@ DispatchQueue.main.async {
         exit(2)
     }
     report("panel-confirmed")
-    if isOpen,
-       let url = panel.url, url.resolvingSymlinksInPath() == sample.resolvingSymlinksInPath(),
-       (try? Data(contentsOf: url)) == bytes {
+    if isOpen {
+        guard let url = panel.url, url.resolvingSymlinksInPath() == sample.resolvingSymlinksInPath() else {
+            report("open-selected-url-mismatch")
+            exit(3)
+        }
+        report("open-selected-url-verified")
+        guard (try? Data(contentsOf: url)) == bytes else {
+            report("open-sample-read-mismatch")
+            exit(3)
+        }
         report("open-sample-verified")
         exit(0)
     }
