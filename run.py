@@ -110,7 +110,15 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         executable = root / "panel-probe"
-        build_result = command("swiftc", "panel.swift", "-o", str(executable), timeout=45)
+        compile_limit = 170 if targeted else 45
+        started = time.monotonic()
+        print(f"compile: started timeout={compile_limit}s", flush=True)
+        try:
+            build_result = command("swiftc", "panel.swift", "-o", str(executable), timeout=compile_limit)
+        except subprocess.TimeoutExpired:
+            print(f"compile: timeout elapsed={time.monotonic() - started:.1f}s", flush=True)
+            raise SystemExit("Standalone probe compiler timed out") from None
+        print(f"compile: exit={build_result.returncode} elapsed={time.monotonic() - started:.1f}s", flush=True)
         if build_result.returncode != 0:
             raise SystemExit("Standalone probe compilation failed")
         print(f"baseline agent: {state()}", flush=True)
