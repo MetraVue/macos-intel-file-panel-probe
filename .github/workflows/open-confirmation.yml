@@ -1,0 +1,15 @@
+name: Confirm native Open panel selection
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  open:
+    runs-on: macos-26-intel
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Read disposable file selected through the Open panel
+        run: python3 run.py --confirm-open-only

@@ -3,14 +3,17 @@ from pathlib import Path
 import platform
 import re
 import subprocess
+import sys
 import tempfile
+import time
 
 MARKERS = {
     "constructor-started", "constructor-returned", "panel-visible-on-screen",
     "native-key-input-posted", "native-key-input-unavailable", "native-escape-posted",
     "programmatic-dismissal-requested", "panel-dismissed-without-confirming",
     "panel-confirmed", "open-sample-verified", "save-sample-verified",
-    "confirmed-operation-unverified",
+    "confirmed-operation-unverified", "open-input-unavailable",
+    "native-open-file-click-posted", "open-file-row-unavailable",
 }
 
 
@@ -34,7 +37,49 @@ def run_panel(executable, phase, kind, root):
     print(f"{phase}/{kind}: {outcome}; {' '.join(marks) or 'no-markers'}", flush=True)
 
 
+def confirm_open(executable, root):
+    folder = root / "open-confirmation"
+    folder.mkdir()
+    transcript = root / "open-transcript"
+    driver_output = b""
+    with transcript.open("wb") as output, subprocess.Popen(
+        [executable, "confirm-open", folder], stdout=output, stderr=subprocess.DEVNULL
+    ) as panel:
+        deadline = time.monotonic() + 17
+        while panel.poll() is None and time.monotonic() < deadline:
+            if b"panel-visible-on-screen" in transcript.read_bytes():
+                try:
+                    driver = subprocess.run([executable, "select-open", str(panel.pid)],
+                                            timeout=12, capture_output=True)
+                    driver_output = driver.stdout
+                except subprocess.TimeoutExpired as error:
+                    driver_output = error.stdout or b""
+                break
+            time.sleep(0.15)
+        try:
+            result = f"exit-{panel.wait(timeout=max(1, deadline - time.monotonic()))}"
+        except subprocess.TimeoutExpired:
+            panel.kill()
+            panel.wait()
+            result = "timeout"
+    panel_output = transcript.read_bytes()
+
+    def markers(output):
+        return [line for line in output.decode(errors="replace").splitlines() if line in MARKERS]
+
+    driver_marks = markers(driver_output)
+    panel_marks = markers(panel_output)
+    print(f"open input: {' '.join(driver_marks) or 'no-markers'}", flush=True)
+    print(f"open result: {result}; {' '.join(panel_marks) or 'no-markers'}", flush=True)
+    return (
+        result == "exit-0"
+        and "native-open-file-click-posted" in driver_marks
+        and {"panel-visible-on-screen", "panel-confirmed", "open-sample-verified"}.issubset(panel_marks)
+    )
+
+
 def main():
+    targeted = sys.argv[1:] == ["--confirm-open-only"]
     machine = platform.machine()
     translation = command("sysctl", "-in", "sysctl.proc_translated").stdout.strip()
     version = command("sw_vers", "-productVersion").stdout.strip()
@@ -60,14 +105,21 @@ def main():
         if build_result.returncode != 0:
             raise SystemExit("Standalone probe compilation failed")
         print(f"baseline agent: {state()}", flush=True)
-        for kind in ("open", "save"):
-            run_panel(executable, "baseline", kind, root)
+        if not targeted:
+            for kind in ("open", "save"):
+                run_panel(executable, "baseline", kind, root)
 
         bootout = command("launchctl", "bootout", service).returncode
         disable = command("launchctl", "disable", service).returncode
         print(f"workaround: bootout-exit={bootout} disable-exit={disable}; {state()}", flush=True)
-        for kind in ("open", "save"):
-            run_panel(executable, "after", kind, root)
+        if targeted:
+            if disable != 0 or state() != "explicitly-disabled=True service-loaded=False":
+                raise SystemExit("Workaround state could not be verified")
+            if not confirm_open(executable, root):
+                raise SystemExit("Open confirmation did not reach the verified file read")
+        else:
+            for kind in ("open", "save"):
+                run_panel(executable, "after", kind, root)
         print(f"final agent: {state()}", flush=True)
 
 
